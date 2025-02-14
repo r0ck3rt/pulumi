@@ -21,9 +21,11 @@ import (
 
 	"github.com/blang/semver"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
+	"github.com/hashicorp/hcl/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/rpcutil"
@@ -32,7 +34,7 @@ import (
 	pulumirpc "github.com/pulumi/pulumi/sdk/v3/proto/go"
 )
 
-// provider reflects a resource plugin, loaded dynamically for a single package.
+// converter reflects a converter plugin, loaded dynamically from another process over gRPC.
 type converter struct {
 	name      string
 	plug      *plugin                   // the actual plugin process wrapper.
@@ -43,15 +45,16 @@ func NewConverter(ctx *Context, name string, version *semver.Version) (Converter
 	prefix := fmt.Sprintf("%v (converter)", name)
 
 	// Load the plugin's path by using the standard workspace logic.
-	path, err := workspace.GetPluginPath(workspace.ConverterPlugin, name, version, ctx.Host.GetProjectPlugins())
+	path, err := workspace.GetPluginPath(ctx.Diag, apitype.ConverterPlugin, name, version, ctx.Host.GetProjectPlugins())
 	if err != nil {
 		return nil, err
 	}
 
 	contract.Assertf(path != "", "unexpected empty path for plugin %s", name)
 
-	plug, err := newPlugin(ctx, ctx.Pwd, path, prefix,
-		workspace.ConverterPlugin, []string{}, os.Environ(), converterPluginDialOptions(ctx, name, ""))
+	plug, _, err := newPlugin(ctx, ctx.Pwd, path, prefix,
+		apitype.ConverterPlugin, []string{}, os.Environ(),
+		testConnection, converterPluginDialOptions(ctx, name, ""))
 	if err != nil {
 		return nil, err
 	}
@@ -104,10 +107,13 @@ func (c *converter) Close() error {
 }
 
 func (c *converter) ConvertState(ctx context.Context, req *ConvertStateRequest) (*ConvertStateResponse, error) {
-	label := fmt.Sprintf("%s.ConvertState", c.label())
+	label := c.label() + ".ConvertState"
 	logging.V(7).Infof("%s executing", label)
 
-	resp, err := c.clientRaw.ConvertState(ctx, &pulumirpc.ConvertStateRequest{})
+	resp, err := c.clientRaw.ConvertState(ctx, &pulumirpc.ConvertStateRequest{
+		MapperTarget: req.MapperTarget,
+		Args:         req.Args,
+	})
 	if err != nil {
 		rpcError := rpcerror.Convert(err)
 		logging.V(8).Infof("%s converter received rpc error `%s`: `%s`", label, rpcError.Code(), rpcError.Message())
@@ -122,20 +128,35 @@ func (c *converter) ConvertState(ctx context.Context, req *ConvertStateRequest) 
 			ID:                resource.Id,
 			Version:           resource.Version,
 			PluginDownloadURL: resource.PluginDownloadURL,
+			LogicalName:       resource.LogicalName,
+			IsRemote:          resource.IsRemote,
+			IsComponent:       resource.IsComponent,
 		}
 	}
 
+	// Translate the rpc diagnostics into hcl.Diagnostics.
+	var diags hcl.Diagnostics
+	for _, rpcDiag := range resp.Diagnostics {
+		diags = append(diags, RPCDiagnosticToHclDiagnostic(rpcDiag))
+	}
+
 	logging.V(7).Infof("%s success", label)
-	return &ConvertStateResponse{Resources: resources}, nil
+	return &ConvertStateResponse{
+		Resources:   resources,
+		Diagnostics: diags,
+	}, nil
 }
 
 func (c *converter) ConvertProgram(ctx context.Context, req *ConvertProgramRequest) (*ConvertProgramResponse, error) {
-	label := fmt.Sprintf("%s.ConvertProgram", c.label())
+	label := c.label() + ".ConvertProgram"
 	logging.V(7).Infof("%s executing", label)
 
-	_, err := c.clientRaw.ConvertProgram(ctx, &pulumirpc.ConvertProgramRequest{
+	resp, err := c.clientRaw.ConvertProgram(ctx, &pulumirpc.ConvertProgramRequest{
 		SourceDirectory: req.SourceDirectory,
 		TargetDirectory: req.TargetDirectory,
+		MapperTarget:    req.MapperTarget,
+		LoaderTarget:    req.LoaderTarget,
+		Args:            req.Args,
 	})
 	if err != nil {
 		rpcError := rpcerror.Convert(err)
@@ -143,6 +164,14 @@ func (c *converter) ConvertProgram(ctx context.Context, req *ConvertProgramReque
 		return nil, err
 	}
 
+	// Translate the rpc diagnostics into hcl.Diagnostics.
+	var diags hcl.Diagnostics
+	for _, rpcDiag := range resp.Diagnostics {
+		diags = append(diags, RPCDiagnosticToHclDiagnostic(rpcDiag))
+	}
+
 	logging.V(7).Infof("%s success", label)
-	return &ConvertProgramResponse{}, nil
+	return &ConvertProgramResponse{
+		Diagnostics: diags,
+	}, nil
 }

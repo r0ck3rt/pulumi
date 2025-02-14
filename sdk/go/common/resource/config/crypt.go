@@ -39,7 +39,8 @@ type Decrypter interface {
 	DecryptValue(ctx context.Context, ciphertext string) (string, error)
 
 	// BulkDecrypt supports bulk decryption of secrets.
-	BulkDecrypt(ctx context.Context, ciphertexts []string) (map[string]string, error)
+	// Returns a list of decrypted values in the same order as the input ciphertexts.
+	BulkDecrypt(ctx context.Context, ciphertexts []string) ([]string, error)
 }
 
 // Crypter can both encrypt and decrypt values.
@@ -60,48 +61,12 @@ func (nopCrypter) DecryptValue(ctx context.Context, ciphertext string) (string, 
 	return ciphertext, nil
 }
 
-func (nopCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) (map[string]string, error) {
+func (nopCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
 	return DefaultBulkDecrypt(ctx, NopDecrypter, ciphertexts)
 }
 
 func (nopCrypter) EncryptValue(ctx context.Context, plaintext string) (string, error) {
 	return plaintext, nil
-}
-
-// TrackingDecrypter is a Decrypter that keeps track if decrypted values, which
-// can be retrieved via SecureValues().
-type TrackingDecrypter interface {
-	Decrypter
-	SecureValues() []string
-}
-
-// NewTrackingDecrypter returns a Decrypter that keeps track of decrypted values.
-func NewTrackingDecrypter(decrypter Decrypter) TrackingDecrypter {
-	return &trackingDecrypter{decrypter: decrypter}
-}
-
-type trackingDecrypter struct {
-	decrypter    Decrypter
-	secureValues []string
-}
-
-func (t *trackingDecrypter) DecryptValue(ctx context.Context, ciphertext string) (string, error) {
-	v, err := t.decrypter.DecryptValue(ctx, ciphertext)
-	if err != nil {
-		return "", err
-	}
-	t.secureValues = append(t.secureValues, v)
-	return v, nil
-}
-
-func (t *trackingDecrypter) BulkDecrypt(
-	ctx context.Context, ciphertexts []string,
-) (map[string]string, error) {
-	return DefaultBulkDecrypt(ctx, t, ciphertexts)
-}
-
-func (t *trackingDecrypter) SecureValues() []string {
-	return t.secureValues
 }
 
 // BlindingCrypter returns a Crypter that instead of decrypting or encrypting data, just returns "[secret]", it can
@@ -124,7 +89,7 @@ func (b blindingCrypter) EncryptValue(ctx context.Context, plaintext string) (st
 	return "[secret]", nil
 }
 
-func (b blindingCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) (map[string]string, error) {
+func (b blindingCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
 	return DefaultBulkDecrypt(ctx, b, ciphertexts)
 }
 
@@ -143,7 +108,7 @@ func (p panicCrypter) DecryptValue(ctx context.Context, _ string) (string, error
 	panic("attempt to decrypt value")
 }
 
-func (p panicCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) (map[string]string, error) {
+func (p panicCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
 	panic("attempt to bulk decrypt values")
 }
 
@@ -191,15 +156,29 @@ func (s symmetricCrypter) DecryptValue(ctx context.Context, value string) (strin
 		return "", fmt.Errorf("bad value: %w", err)
 	}
 
-	enc, err := base64.StdEncoding.DecodeString(vals[2])
+	ciphertext, err := base64.StdEncoding.DecodeString(vals[2])
 	if err != nil {
 		return "", fmt.Errorf("bad value: %w", err)
 	}
 
-	return decryptAES256GCM(enc, s.key, nonce)
+	contract.Requiref(len(s.key) == SymmetricCrypterKeyBytes, "key", "AES-256-GCM needs a 32 byte key")
+
+	block, err := aes.NewCipher(s.key)
+	contract.AssertNoErrorf(err, "error creating AES cipher")
+
+	aesgcm, err := cipher.NewGCM(block)
+	contract.AssertNoErrorf(err, "error creating AES-GCM cipher")
+
+	if len(nonce) != aesgcm.NonceSize() {
+		return "", errors.New("bad value: nonce size is incorrect")
+	}
+
+	msg, err := aesgcm.Open(nil, nonce, ciphertext, nil)
+
+	return string(msg), err
 }
 
-func (s symmetricCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) (map[string]string, error) {
+func (s symmetricCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
 	return DefaultBulkDecrypt(ctx, s, ciphertexts)
 }
 
@@ -223,20 +202,6 @@ func encryptAES256GCGM(plaintext string, key []byte) ([]byte, []byte) {
 	return msg, nonce
 }
 
-func decryptAES256GCM(ciphertext []byte, key []byte, nonce []byte) (string, error) {
-	contract.Requiref(len(key) == SymmetricCrypterKeyBytes, "key", "AES-256-GCM needs a 32 byte key")
-
-	block, err := aes.NewCipher(key)
-	contract.AssertNoErrorf(err, "error creating AES cipher")
-
-	aesgcm, err := cipher.NewGCM(block)
-	contract.AssertNoErrorf(err, "error creating AES-GCM cipher")
-
-	msg, err := aesgcm.Open(nil, nonce, ciphertext, nil)
-
-	return string(msg), err
-}
-
 // Crypter that just adds a prefix to the plaintext string when encrypting,
 // and removes the prefix from the ciphertext when decrypting, for use in tests.
 type prefixCrypter struct {
@@ -255,7 +220,7 @@ func (c prefixCrypter) EncryptValue(ctx context.Context, plaintext string) (stri
 	return c.prefix + plaintext, nil
 }
 
-func (c prefixCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) (map[string]string, error) {
+func (c prefixCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
 	return DefaultBulkDecrypt(ctx, c, ciphertexts)
 }
 
@@ -264,20 +229,20 @@ func (c prefixCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) (m
 // their BulkDecrypt method in cases where they can't do more efficient than just individual decryptions.
 func DefaultBulkDecrypt(ctx context.Context,
 	decrypter Decrypter, ciphertexts []string,
-) (map[string]string, error) {
+) ([]string, error) {
 	if len(ciphertexts) == 0 {
 		return nil, nil
 	}
 
-	secretMap := map[string]string{}
-	for _, ct := range ciphertexts {
+	decrypted := make([]string, len(ciphertexts))
+	for i, ct := range ciphertexts {
 		pt, err := decrypter.DecryptValue(ctx, ct)
 		if err != nil {
 			return nil, err
 		}
-		secretMap[ct] = pt
+		decrypted[i] = pt
 	}
-	return secretMap, nil
+	return decrypted, nil
 }
 
 type base64Crypter struct{}
@@ -297,6 +262,6 @@ func (c *base64Crypter) DecryptValue(ctx context.Context, s string) (string, err
 	return string(b), nil
 }
 
-func (c *base64Crypter) BulkDecrypt(ctx context.Context, ciphertexts []string) (map[string]string, error) {
+func (c *base64Crypter) BulkDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
 	return DefaultBulkDecrypt(ctx, c, ciphertexts)
 }

@@ -19,7 +19,6 @@ import (
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/tokens"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
-	"github.com/pulumi/pulumi/sdk/v3/go/common/util/result"
 )
 
 // NullSource is a source that never returns any resources.  This may be used in scenarios where the "new"
@@ -40,9 +39,7 @@ func (src *nullSource) Close() error                { return nil }
 func (src *nullSource) Project() tokens.PackageName { return src.project }
 func (src *nullSource) Info() interface{}           { return nil }
 
-func (src *nullSource) Iterate(
-	ctx context.Context, opts Options, providers ProviderSource,
-) (SourceIterator, result.Result) {
+func (src *nullSource) Iterate(ctx context.Context, providers ProviderSource) (SourceIterator, error) {
 	contract.Ignore(ctx)
 	return &nullSourceIterator{}, nil
 }
@@ -54,6 +51,6 @@ func (iter *nullSourceIterator) Close() error {
 	return nil // nothing to do.
 }
 
-func (iter *nullSourceIterator) Next() (SourceEvent, result.Result) {
+func (iter *nullSourceIterator) Next() (SourceEvent, error) {
 	return nil, nil // means "done"
 }

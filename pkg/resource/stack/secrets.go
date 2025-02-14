@@ -20,12 +20,12 @@ import (
 	"fmt"
 
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
-	"github.com/pulumi/pulumi/pkg/v3/secrets/b64"
 	"github.com/pulumi/pulumi/pkg/v3/secrets/cloud"
 	"github.com/pulumi/pulumi/pkg/v3/secrets/passphrase"
 	"github.com/pulumi/pulumi/pkg/v3/secrets/service"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/config"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 )
 
 // DefaultSecretsProvider is the default SecretsProvider to use when deserializing deployments.
@@ -37,15 +37,43 @@ var DefaultSecretsProvider secrets.Provider = &defaultSecretsProvider{}
 type defaultSecretsProvider struct{}
 
 // OfType returns a secrets manager for the given secrets type. Returns an error
-// if the type is uknown or the state is invalid.
+// if the type is unknown or the state is invalid.
 func (defaultSecretsProvider) OfType(ty string, state json.RawMessage) (secrets.Manager, error) {
 	var sm secrets.Manager
 	var err error
 	switch ty {
-	case b64.Type:
-		sm = b64.NewBase64SecretsManager()
 	case passphrase.Type:
 		sm, err = passphrase.NewPromptingPassphraseSecretsManagerFromState(state)
+	case service.Type:
+		sm, err = service.NewServiceSecretsManagerFromState(state)
+	case cloud.Type:
+		sm, err = cloud.NewCloudSecretsManagerFromState(state)
+	default:
+		return nil, fmt.Errorf("no known secrets provider for type %q", ty)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("constructing secrets manager of type %q: %w", ty, err)
+	}
+
+	return NewCachingSecretsManager(sm), nil
+}
+
+// NamedStackSecretsProvider is the same as the default secrets provider,
+// but is aware of the stack name for which it is used.  Currently
+// this is only used for prompting passphrase secrets managers to show
+// the stackname in the prompt for the passphrase.
+type NamedStackSecretsProvider struct {
+	StackName string
+}
+
+// OfType returns a secrets manager for the given secrets type. Returns an error
+// if the type is unknown or the state is invalid.
+func (s NamedStackSecretsProvider) OfType(ty string, state json.RawMessage) (secrets.Manager, error) {
+	var sm secrets.Manager
+	var err error
+	switch ty {
+	case passphrase.Type:
+		sm, err = passphrase.NewStackPromptingPassphraseSecretsManagerFromState(state, s.StackName)
 	case service.Type:
 		sm, err = service.NewServiceSecretsManagerFromState(state)
 	case cloud.Type:
@@ -84,7 +112,7 @@ func (csm *cachingSecretsManager) Type() string {
 	return csm.manager.Type()
 }
 
-func (csm *cachingSecretsManager) State() interface{} {
+func (csm *cachingSecretsManager) State() json.RawMessage {
 	return csm.manager.State()
 }
 
@@ -124,14 +152,12 @@ func (c *cachingCrypter) DecryptValue(ctx context.Context, ciphertext string) (s
 	return c.decrypter.DecryptValue(ctx, ciphertext)
 }
 
-func (c *cachingCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) (map[string]string, error) {
+func (c *cachingCrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
 	return c.decrypter.BulkDecrypt(ctx, ciphertexts)
 }
 
 // encryptSecret encrypts the plaintext associated with the given secret value.
-func (c *cachingCrypter) encryptSecret(secret *resource.Secret, plaintext string) (string, error) {
-	ctx := context.TODO()
-
+func (c *cachingCrypter) encryptSecret(ctx context.Context, secret *resource.Secret, plaintext string) (string, error) {
 	// If the cache has an entry for this secret and the plaintext has not changed, re-use the ciphertext.
 	//
 	// Otherwise, re-encrypt the plaintext and update the cache.
@@ -190,22 +216,26 @@ func (c *mapDecrypter) DecryptValue(ctx context.Context, ciphertext string) (str
 	return plaintext, nil
 }
 
-func (c *mapDecrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) (map[string]string, error) {
+func (c *mapDecrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) ([]string, error) {
 	// Loop and find the entries that are already cached, then BulkDecrypt the rest
-	secretMap := map[string]string{}
+	decryptedResult := make([]string, len(ciphertexts))
 	var toDecrypt []string
 	if c.cache == nil {
 		// Don't bother searching for the cached subset if the cache is nil
 		toDecrypt = ciphertexts
 	} else {
-		toDecrypt = make([]string, 0)
-		for _, ct := range ciphertexts {
+		toDecrypt = make([]string, 0, len(ciphertexts))
+		for i, ct := range ciphertexts {
 			if plaintext, ok := c.cache[ct]; ok {
-				secretMap[ct] = plaintext
+				decryptedResult[i] = plaintext
 			} else {
 				toDecrypt = append(toDecrypt, ct)
 			}
 		}
+	}
+
+	if len(toDecrypt) == 0 {
+		return decryptedResult, nil
 	}
 
 	// try and bulk decrypt the rest
@@ -218,11 +248,17 @@ func (c *mapDecrypter) BulkDecrypt(ctx context.Context, ciphertexts []string) (m
 	if c.cache == nil {
 		c.cache = make(map[string]string)
 	}
-
-	for ct, pt := range decrypted {
-		secretMap[ct] = pt
+	for i, ct := range toDecrypt {
+		pt := decrypted[i]
 		c.cache[ct] = pt
 	}
 
-	return secretMap, nil
+	// Re-populate results
+	for i, ct := range ciphertexts {
+		plaintext, ok := c.cache[ct]
+		contract.Assertf(ok, "decrypted value not found in cache after bulk request")
+		decryptedResult[i] = plaintext
+	}
+
+	return decryptedResult, nil
 }

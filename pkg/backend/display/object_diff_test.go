@@ -15,8 +15,10 @@
 package display
 
 import (
+	"bytes"
 	"testing"
 
+	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,12 +33,17 @@ func Test_decodeValue(t *testing.T) {
 		expected interface{}
 	}{
 		// Negative cases
+		{repr: ""},
 		{repr: "foo"},
 		{repr: "1.0"},
 		{repr: "true"},
 		{repr: "no"},
 		{repr: "-"},
 		{repr: "foo: bar"},
+		{repr: "[] bar"},
+		{repr: "{} bar"},
+		{repr: "[] \n not yaml"},
+		{repr: "---\n'hello'\n...\n---\ngoodbye\n...\n"},
 
 		// Positive cases
 		{
@@ -58,6 +65,11 @@ func Test_decodeValue(t *testing.T) {
 			repr:     `{"foo": "bar"}`,
 			kind:     "json",
 			expected: map[string]interface{}{"foo": "bar"},
+		},
+		{
+			repr:     `  {"with": "whitespace"}  `,
+			kind:     "json",
+			expected: map[string]interface{}{"with": "whitespace"},
 		},
 		{
 			repr:     "- foo\n- bar",
@@ -88,6 +100,80 @@ func Test_decodeValue(t *testing.T) {
 				require.Equal(t, c.kind, kind)
 				assert.True(t, resource.NewPropertyValue(c.expected).DeepEquals(actual))
 			}
+		})
+	}
+}
+
+func Test_PrintObject(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		object     resource.PropertyMap
+		expected   string
+		showSecret bool
+	}{
+		{
+			"numbers",
+			resource.NewPropertyMapFromMap(map[string]interface{}{
+				"int":         1,
+				"float":       2.3,
+				"large_int":   1234567,
+				"large_float": 1234567.1234567,
+			}),
+			`<{%reset%}>float      : <{%reset%}><{%reset%}>2.3<{%reset%}><{%reset%}>
+<{%reset%}><{%reset%}>int        : <{%reset%}><{%reset%}>1<{%reset%}><{%reset%}>
+<{%reset%}><{%reset%}>large_float: <{%reset%}><{%reset%}>1.2345671234567e+06<{%reset%}><{%reset%}>
+<{%reset%}><{%reset%}>large_int  : <{%reset%}><{%reset%}>1234567<{%reset%}><{%reset%}>
+<{%reset%}>`,
+			false,
+		},
+		{
+			"secret_noshow",
+			resource.NewPropertyMapFromMap(map[string]interface{}{
+				"secret": resource.NewSecretProperty(&resource.Secret{Element: resource.NewStringProperty("secrets")}),
+				"nested_secret": resource.NewPropertyMapFromMap(map[string]interface{}{
+					"super_secret": resource.NewSecretProperty(&resource.Secret{
+						Element: resource.NewStringProperty("super_secret"),
+					}),
+				}),
+			}),
+			`<{%reset%}>nested_secret: <{%reset%}><{%reset%}>{
+<{%reset%}><{%reset%}>    super_secret: <{%reset%}><{%reset%}>[secret]<{%reset%}><{%reset%}>
+<{%reset%}><{%reset%}>}<{%reset%}><{%reset%}>
+<{%reset%}><{%reset%}>secret       : <{%reset%}><{%reset%}>[secret]<{%reset%}><{%reset%}>
+<{%reset%}>`,
+			false,
+		},
+		{
+			"secrets_show",
+			resource.NewPropertyMapFromMap(map[string]interface{}{
+				"secret": resource.NewSecretProperty(&resource.Secret{Element: resource.NewStringProperty("my_secret")}),
+				"nested_secret": resource.NewPropertyMapFromMap(map[string]interface{}{
+					"super_secret": resource.NewSecretProperty(&resource.Secret{
+						Element: resource.NewStringProperty("my_super_secret"),
+					}),
+				}),
+			}),
+			`<{%reset%}>nested_secret: <{%reset%}><{%reset%}>{
+<{%reset%}><{%reset%}>    super_secret: <{%reset%}><{%reset%}>"my_super_secret"<{%reset%}><{%reset%}>
+<{%reset%}><{%reset%}>
+<{%reset%}><{%reset%}>}<{%reset%}><{%reset%}>
+<{%reset%}><{%reset%}>secret       : <{%reset%}><{%reset%}>"my_secret"<{%reset%}><{%reset%}>
+<{%reset%}><{%reset%}>
+<{%reset%}>`,
+			true,
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+			PrintObject(&buf, c.object, false, 0, deploy.OpSame, false, false, false, c.showSecret)
+			assert.Equal(t, c.expected, buf.String())
 		})
 	}
 }

@@ -46,6 +46,9 @@ type ResourceOptions struct {
 	Version model.Expression
 	// The plugin download URL for this resource.
 	PluginDownloadURL model.Expression
+	// If set, the provider's Delete method will not be called for this resource if the specified resource is being
+	// deleted as well.
+	DeletedWith model.Expression
 }
 
 // Resource represents a resource instantiation inside of a program or component.
@@ -61,6 +64,10 @@ type Resource struct {
 
 	// The definition of the resource.
 	Definition *model.Block
+
+	// When set to true, allows traversing unknown properties through a resource. i.e. `resource.unknownProperty`
+	// will be valid and the type of the traversal is dynamic. This property is set to false by default
+	LenientTraversal bool
 
 	// Token is the type token for this resource.
 	Token string
@@ -98,7 +105,17 @@ func (r *Resource) VisitExpressions(pre, post model.ExpressionVisitor) hcl.Diagn
 }
 
 func (r *Resource) Traverse(traverser hcl.Traverser) (model.Traversable, hcl.Diagnostics) {
-	return r.VariableType.Traverse(traverser)
+	if r == nil || r.VariableType == nil {
+		return model.DynamicType.Traverse(traverser)
+	}
+
+	traversable, diags := r.VariableType.Traverse(traverser)
+
+	if diags.HasErrors() && r.LenientTraversal {
+		return model.DynamicType.Traverse(traverser)
+	}
+
+	return traversable, diags
 }
 
 // Deprecated: Name returns the variable or declaration name of the resource.

@@ -45,10 +45,15 @@ from .settings import (
 from .stack import (
     run_in_stack,
     register_stack_transformation,
+    register_stack_transform,
+    register_resource_transform,
+    register_invoke_transform,
 )
 
 from .invoke import (
     invoke,
+    invoke_async,
+    invoke_output,
     call,
 )
 
@@ -70,6 +75,8 @@ __all__ = [
     "get_config",
     "get_config_env",
     "get_config_env_key",
+    "get_config_secret_keys_env",
+    "is_config_secret",
     # mocks
     "Mocks",
     "set_mocks",
@@ -85,8 +92,14 @@ __all__ = [
     # stack
     "run_in_stack",
     "register_stack_transformation",
+    "register_stack_transform",
+    "register_resource_transform",
+    "register_invoke_transform",
     # invoke
     "invoke",
+    "invoke_async",
+    "invoke_output",
+    "call",
     # _json
     "to_json",
     # rpc

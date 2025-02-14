@@ -23,6 +23,7 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/pulumi/pulumi/pkg/v3/codegen/hcl2/syntax"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/convert"
@@ -725,6 +726,11 @@ type ForExpression struct {
 	// True if the value expression is being grouped.
 	Group bool
 
+	// Whether the collection type should be strictly type-checked
+	// When true, unsupported collection types will result in an error
+	// otherwise a warning will be emitted
+	StrictCollectionTypechecking bool
+
 	exprType Type
 }
 
@@ -760,10 +766,7 @@ func (x *ForExpression) typecheck(typecheckCollection, typecheckOperands bool) h
 	}
 
 	if typecheckCollection {
-		// Poke through any eventual and optional types that may wrap the collection type.
-		collectionType := unwrapIterableSourceType(x.Collection.Type())
-
-		keyType, valueType, kvDiags := GetCollectionTypes(collectionType, rng)
+		keyType, valueType, kvDiags := GetCollectionTypes(x.Collection.Type(), rng, x.StrictCollectionTypechecking)
 		diagnostics = append(diagnostics, kvDiags...)
 
 		if x.KeyVariable != nil {
@@ -1149,6 +1152,10 @@ type IndexExpression struct {
 	Collection Expression
 	// The index key.
 	Key Expression
+	// Whether the collection type should be strictly type-checked
+	// When true, unsupported collection types will result in an error
+	// otherwise a warning will be emitted
+	StrictCollectionTypechecking bool
 
 	keyType  Type
 	exprType Type
@@ -1193,8 +1200,7 @@ func (x *IndexExpression) Typecheck(typecheckOperands bool) hcl.Diagnostics {
 		rng = x.Syntax.Collection.Range()
 	}
 
-	collectionType := unwrapIterableSourceType(x.Collection.Type())
-	keyType, valueType, kvDiags := GetCollectionTypes(collectionType, rng)
+	keyType, valueType, kvDiags := GetCollectionTypes(x.Collection.Type(), rng, x.StrictCollectionTypechecking)
 	diagnostics = append(diagnostics, kvDiags...)
 	x.keyType = keyType
 
@@ -1289,7 +1295,7 @@ func literalText(value cty.Value, rawBytes []byte, escaped, quoted bool) string 
 		bf := value.AsBigFloat()
 		i, acc := bf.Int64()
 		if acc == big.Exact {
-			return fmt.Sprintf("%v", i)
+			return strconv.FormatInt(i, 10)
 		}
 		d, _ := bf.Float64()
 		return fmt.Sprintf("%g", d)
@@ -1314,7 +1320,7 @@ func escapeString(s string) string {
 
 	// Escape `${`
 	runes := []rune(s)
-	out := make([]rune, 0, len(runes))
+	out := slice.Prealloc[rune](len(runes))
 	for i, r := range runes {
 		next := func() rune {
 			if i >= len(runes)-1 {
@@ -1510,7 +1516,7 @@ func (x *ObjectConsExpression) WithType(updateType func(Type) *ObjectConsExpress
 func (x *ObjectConsExpression) Typecheck(typecheckOperands bool) hcl.Diagnostics {
 	var diagnostics hcl.Diagnostics
 
-	keys := make([]Expression, 0, len(x.Items))
+	keys := slice.Prealloc[Expression](len(x.Items))
 	for _, item := range x.Items {
 		if typecheckOperands {
 			keyDiags := item.Key.Typecheck(true)
