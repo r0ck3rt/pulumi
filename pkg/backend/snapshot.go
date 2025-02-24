@@ -1,4 +1,4 @@
-// Copyright 2016-2022, Pulumi Corporation.
+// Copyright 2016-2024, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,19 +17,27 @@ package backend
 import (
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
-	"sort"
+	"strings"
 	"time"
+
+	"golang.org/x/exp/slices"
 
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/pkg/v3/secrets"
-	"github.com/pulumi/pulumi/pkg/v3/version"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/env"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/contract"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/util/logging"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/version"
 )
+
+// DisableIntegrityChecking can be set to true to disable checkpoint state integrity verification.  This is not
+// recommended, because it could mean proceeding even in the face of a corrupted checkpoint state file, but can
+// be used as a last resort when a command absolutely must be run.
+var DisableIntegrityChecking bool
 
 // SnapshotPersister is an interface implemented by our backends that implements snapshot
 // persistence. In order to fit into our current model, snapshot persisters have two functions:
@@ -37,8 +45,6 @@ import (
 type SnapshotPersister interface {
 	// Persists the given snapshot. Returns an error if the persistence failed.
 	Save(snapshot *deploy.Snapshot) error
-	// Gets the secrets manager used by this persister.
-	SecretsManager() secrets.Manager
 }
 
 // SnapshotManager is an implementation of engine.SnapshotManager that inspects steps and performs
@@ -59,11 +65,11 @@ type SnapshotPersister interface {
 type SnapshotManager struct {
 	persister        SnapshotPersister        // The persister responsible for invalidating and persisting the snapshot
 	baseSnapshot     *deploy.Snapshot         // The base snapshot for this plan
+	secretsManager   secrets.Manager          // The default secrets manager to use
 	resources        []*resource.State        // The list of resources operated upon by this plan
 	operations       []resource.Operation     // The set of operations known to be outstanding in this plan
 	dones            map[*resource.State]bool // The set of resources that have been operated upon already by this plan
 	completeOps      map[*resource.State]bool // The set of resources that have completed their operation
-	doVerify         bool                     // If true, verify the snapshot before persisting it
 	mutationRequests chan<- mutationRequest   // The queue of mutation requests, to be retired serially by the manager
 	cancel           chan bool                // A channel used to request cancellation of any new mutation requests.
 	done             <-chan error             // A channel that sends a single result when the manager has shut down.
@@ -120,7 +126,15 @@ func (sm *SnapshotManager) mutate(mutator func() bool) error {
 // Note that this is completely not thread-safe and defeats the purpose of having a `mutate` callback
 // entirely, but the hope is that this state of things will not be permament.
 func (sm *SnapshotManager) RegisterResourceOutputs(step deploy.Step) error {
-	return sm.mutate(func() bool { return true })
+	return sm.mutate(func() bool {
+		old, new := step.Old(), step.New()
+		if old != nil && new != nil && old.Outputs.DeepEquals(new.Outputs) {
+			logging.V(9).Infof("SnapshotManager: eliding RegisterResourceOutputs due to equal outputs")
+			return false
+		}
+
+		return true
+	})
 }
 
 // BeginMutation signals to the SnapshotManager that the engine intends to mutate the global snapshot
@@ -255,23 +269,28 @@ func (ssm *sameSnapshotMutation) mustWrite(step *deploy.SameStep) bool {
 		return true
 	}
 
-	// Sort dependencies before comparing them. If the dependencies have changed, we must write the checkpoint.
-	sortDeps := func(deps []resource.URN) {
-		sort.Slice(deps, func(i, j int) bool { return deps[i] < deps[j] })
-	}
-	sortDeps(old.Dependencies)
-	sortDeps(new.Dependencies)
 	// reflect.DeepEqual does not treat `nil` and `[]URN{}` as equal, so we must check for both
 	// lists being empty ourselves.
 	if len(old.Dependencies) != 0 || len(new.Dependencies) != 0 {
-		if !reflect.DeepEqual(old.Dependencies, new.Dependencies) {
+		// Sort dependencies before comparing them. If the dependencies have changed, we must write the checkpoint.
+		sortDeps := func(deps []resource.URN) []resource.URN {
+			result := make([]resource.URN, len(deps))
+			copy(result, deps)
+			slices.Sort(result)
+			return result
+		}
+		oldDeps := sortDeps(old.Dependencies)
+		newDeps := sortDeps(new.Dependencies)
+		if !reflect.DeepEqual(oldDeps, newDeps) {
 			logging.V(9).Infof("SnapshotManager: mustWrite() true because of Dependencies")
 			return true
 		}
 	}
 
 	// Init errors are strictly advisory, so we do not consider them when deciding whether or not to write the
-	// checkpoint.
+	// checkpoint. Likewise source positions are purely metadata and do not affect the system correctness, so
+	// for performance we elide those as well. This prevents _every_ resource needing a snapshot write when
+	// making large source code changes.
 
 	logging.V(9).Infof("SnapshotManager: mustWrite() false")
 	return false
@@ -280,31 +299,33 @@ func (ssm *sameSnapshotMutation) mustWrite(step *deploy.SameStep) bool {
 func (ssm *sameSnapshotMutation) End(step deploy.Step, successful bool) error {
 	contract.Requiref(step != nil, "step", "must not be nil")
 	contract.Requiref(step.Op() == deploy.OpSame, "step.Op()", "must be %q, got %q", deploy.OpSame, step.Op())
-	contract.Assertf(successful, "expected mutation to be successful")
 	logging.V(9).Infof("SnapshotManager: sameSnapshotMutation.End(..., %v)", successful)
 	return ssm.manager.mutate(func() bool {
 		sameStep := step.(*deploy.SameStep)
 
-		ssm.manager.markDone(step.Old())
+		ssm.manager.markOperationComplete(step.New())
+		if successful {
+			ssm.manager.markDone(step.Old())
 
-		// In the case of a 'resource create' in a program that wasn't specified by the user in the
-		// --target list, we *never* want to write this to the checkpoint.  We treat it as if it
-		// doesn't exist at all.  That way when the program runs the next time, we'll actually
-		// create it.
-		if sameStep.IsSkippedCreate() {
-			return false
-		}
+			// In the case of a 'resource create' in a program that wasn't specified by the user in the
+			// --target list, we *never* want to write this to the checkpoint.  We treat it as if it
+			// doesn't exist at all.  That way when the program runs the next time, we'll actually
+			// create it.
+			if sameStep.IsSkippedCreate() {
+				return false
+			}
 
-		ssm.manager.markNew(step.New())
+			ssm.manager.markNew(step.New())
 
-		// Note that "Same" steps only consider input and provider diffs, so it is possible to see a same step for a
-		// resource with new dependencies, outputs, parent, protection. etc.
-		//
-		// As such, we diff all of the non-input properties of the resource here and write the snapshot if we find any
-		// changes.
-		if !ssm.mustWrite(sameStep) {
-			logging.V(9).Infof("SnapshotManager: sameSnapshotMutation.End() eliding write")
-			return false
+			// Note that "Same" steps only consider input and provider diffs, so it is possible to see a same step for a
+			// resource with new dependencies, outputs, parent, protection. etc.
+			//
+			// As such, we diff all of the non-input properties of the resource here and write the snapshot if we find any
+			// changes.
+			if !ssm.mustWrite(sameStep) {
+				logging.V(9).Infof("SnapshotManager: sameSnapshotMutation.End() eliding write")
+				return false
+			}
 		}
 
 		logging.V(9).Infof("SnapshotManager: sameSnapshotMutation.End() not eliding write")
@@ -631,23 +652,63 @@ func (sm *SnapshotManager) snap() *deploy.Snapshot {
 		// Plugins: sm.plugins, - Explicitly dropped, since we don't use the plugin list in the manifest anymore.
 	}
 
+	// The backend.SnapshotManager and backend.SnapshotPersister will keep track of any changes to
+	// the Snapshot (checkpoint file) in the HTTP backend. We will reuse the snapshot's secrets manager when possible
+	// to ensure that secrets are not re-encrypted on each update.
+	secretsManager := sm.secretsManager
+	if sm.baseSnapshot != nil && secrets.AreCompatible(secretsManager, sm.baseSnapshot.SecretsManager) {
+		secretsManager = sm.baseSnapshot.SecretsManager
+	}
+
+	var metadata deploy.SnapshotMetadata
+	if sm.baseSnapshot != nil {
+		metadata = sm.baseSnapshot.Metadata
+	}
+
 	manifest.Magic = manifest.NewMagic()
-	return deploy.NewSnapshot(manifest, sm.persister.SecretsManager(), resources, operations)
+	return deploy.NewSnapshot(manifest, secretsManager, resources, operations, metadata)
 }
 
-// saveSnapshot persists the current snapshot and optionally verifies it afterwards.
+// saveSnapshot persists the current snapshot. If integrity checking is enabled,
+// the snapshot's integrity is also verified. If the snapshot is invalid,
+// metadata about this write operation is added to the snapshot before it is
+// written, in order to aid debugging should future operations fail with an
+// error.
 func (sm *SnapshotManager) saveSnapshot() error {
 	snap, err := sm.snap().NormalizeURNReferences()
 	if err != nil {
 		return fmt.Errorf("failed to normalize URN references: %w", err)
 	}
+
+	// In order to persist metadata about snapshot integrity issues, we check the
+	// snapshot's validity *before* we write it. However, should an error occur,
+	// we will only raise this *after* the write has completed. In the event that
+	// integrity checking is disabled, we still actually perform the check (and
+	// write metadata appropriately), but we will not raise the error following a
+	// successful write.
+	//
+	// If the actual write fails for any reason, this error will supersede any
+	// integrity error. This matches behaviour prior to when integrity metadata
+	// writing was introduced.
+	//
+	// Metadata will be cleared out by a successful operation (even if integrity
+	// checking is being enforced).
+	integrityError := snap.VerifyIntegrity()
+	if integrityError == nil {
+		snap.Metadata.IntegrityErrorMetadata = nil
+	} else {
+		snap.Metadata.IntegrityErrorMetadata = &deploy.SnapshotIntegrityErrorMetadata{
+			Version: version.Version,
+			Command: strings.Join(os.Args, " "),
+			Error:   integrityError.Error(),
+		}
+	}
+
 	if err := sm.persister.Save(snap); err != nil {
 		return fmt.Errorf("failed to save snapshot: %w", err)
 	}
-	if sm.doVerify {
-		if err := snap.VerifyIntegrity(); err != nil {
-			return fmt.Errorf("failed to verify snapshot: %w", err)
-		}
+	if !DisableIntegrityChecking && integrityError != nil {
+		return fmt.Errorf("failed to verify snapshot: %w", integrityError)
 	}
 	return nil
 }
@@ -655,7 +716,7 @@ func (sm *SnapshotManager) saveSnapshot() error {
 // defaultServiceLoop saves a Snapshot whenever a mutation occurs
 func (sm *SnapshotManager) defaultServiceLoop(mutationRequests chan mutationRequest, done chan error) {
 	// True if we have elided writes since the last actual write.
-	hasElidedWrites := false
+	hasElidedWrites := true
 
 	// Service each mutation request in turn.
 serviceLoop:
@@ -700,21 +761,25 @@ func (sm *SnapshotManager) unsafeServiceLoop(mutationRequests chan mutationReque
 	}
 }
 
-// NewSnapshotManager creates a new SnapshotManager for the given stack name, using the given persister
-// and base snapshot.
+// NewSnapshotManager creates a new SnapshotManager for the given stack name, using the given persister, default secrets
+// manager and base snapshot.
 //
-// It is *very important* that the baseSnap pointer refers to the same Snapshot
-// given to the engine! The engine will mutate this object and correctness of the
-// SnapshotManager depends on being able to observe this mutation. (This is not ideal...)
-func NewSnapshotManager(persister SnapshotPersister, baseSnap *deploy.Snapshot) *SnapshotManager {
+// It is *very important* that the baseSnap pointer refers to the same Snapshot given to the engine! The engine will
+// mutate this object and correctness of the SnapshotManager depends on being able to observe this mutation. (This is
+// not ideal...)
+func NewSnapshotManager(
+	persister SnapshotPersister,
+	secretsManager secrets.Manager,
+	baseSnap *deploy.Snapshot,
+) *SnapshotManager {
 	mutationRequests, cancel, done := make(chan mutationRequest), make(chan bool), make(chan error)
 
 	manager := &SnapshotManager{
 		persister:        persister,
+		secretsManager:   secretsManager,
 		baseSnapshot:     baseSnap,
 		dones:            make(map[*resource.State]bool),
 		completeOps:      make(map[*resource.State]bool),
-		doVerify:         true,
 		mutationRequests: mutationRequests,
 		cancel:           cancel,
 		done:             done,
