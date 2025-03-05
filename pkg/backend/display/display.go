@@ -1,4 +1,4 @@
-// Copyright 2016-2018, Pulumi Corporation.
+// Copyright 2016-2024, Pulumi Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/pulumi/pulumi/pkg/v3/backend/display/internal/terminal"
+	"github.com/pulumi/pulumi/pkg/v3/channel"
 	"github.com/pulumi/pulumi/pkg/v3/engine"
 	"github.com/pulumi/pulumi/pkg/v3/resource/deploy"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
@@ -60,12 +61,17 @@ func printPermalink(out io.Writer, opts Options, message, permalink string) {
 // it comes in. Once all events have been read from the channel and displayed, it closes the `done`
 // channel so the caller can await all the events being written.
 func ShowEvents(
-	op string, action apitype.UpdateKind, stack tokens.Name, proj tokens.PackageName,
+	op string, action apitype.UpdateKind, stack tokens.StackName, proj tokens.PackageName,
 	permalink string, events <-chan engine.Event, done chan<- bool, opts Options, isPreview bool,
 ) {
 	if opts.EventLogPath != "" {
 		events, done = startEventLogger(events, done, opts)
 	}
+
+	// Need to filter the engine events here to exclude any internal events.
+	events = channel.FilterRead(events, func(e engine.Event) bool {
+		return !e.Internal()
+	})
 
 	streamPreview := cmdutil.IsTruthy(os.Getenv("PULUMI_ENABLE_STREAMING_JSON_PREVIEW"))
 
@@ -179,7 +185,7 @@ func isRootStack(step engine.StepEventMetadata) bool {
 }
 
 func isRootURN(urn resource.URN) bool {
-	return urn != "" && urn.Type() == resource.RootStackType
+	return urn != "" && urn.QualifiedType() == resource.RootStackType
 }
 
 // shouldShow returns true if a step should show in the output.
@@ -193,19 +199,16 @@ func shouldShow(step engine.StepEventMetadata, opts Options) bool {
 		return opts.ShowSameResources
 	}
 
-	// For logical replacement operations, only show them during progress-style updates (since this is integrated
+	// For non-logical replacement operations, only show them during progress-style updates (since this is integrated
 	// into the resource status update), or if it is requested explicitly (for diffs and JSON outputs).
-	if (opts.Type == DisplayDiff || opts.JSONDisplay) && !step.Logical && !opts.ShowReplacementSteps {
-		return false
+	if !opts.ShowReplacementSteps {
+		if (opts.Type == DisplayDiff || opts.JSONDisplay) && !step.Logical && deploy.IsReplacementStep(step.Op) {
+			return false
+		}
 	}
 
 	// Otherwise, default to showing the operation.
 	return true
-}
-
-func fprintfIgnoreError(w io.Writer, format string, a ...interface{}) {
-	_, err := fmt.Fprintf(w, format, a...)
-	contract.IgnoreError(err)
 }
 
 func fprintIgnoreError(w io.Writer, a ...interface{}) {

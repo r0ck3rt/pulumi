@@ -1,3 +1,17 @@
+// Copyright 2020-2024, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package pulumi
 
 import (
@@ -5,9 +19,11 @@ import (
 	"log"
 	"sync"
 
-	"github.com/golang/protobuf/ptypes/empty"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/resource/plugin"
@@ -72,12 +88,12 @@ type mockMonitor struct {
 
 func (m *mockMonitor) newURN(parent, typ, name string) string {
 	parentType := tokens.Type("")
-	if parentURN := resource.URN(parent); parentURN != "" && parentURN.Type() != resource.RootStackType {
+	if parentURN := resource.URN(parent); parentURN != "" && parentURN.QualifiedType() != resource.RootStackType {
 		parentType = parentURN.QualifiedType()
 	}
 
 	return string(resource.NewURN(tokens.QName(m.stack), tokens.PackageName(m.project), parentType, tokens.Type(typ),
-		tokens.QName(name)))
+		name))
 }
 
 func (m *mockMonitor) SupportsFeature(ctx context.Context, in *pulumirpc.SupportsFeatureRequest,
@@ -87,7 +103,7 @@ func (m *mockMonitor) SupportsFeature(ctx context.Context, in *pulumirpc.Support
 
 	// Support for "outputValues" is deliberately disabled for the mock monitor so
 	// instances of `Output` don't show up in `MockResourceArgs` Inputs.
-	hasSupport := id == "secrets" || id == "resourceReferences"
+	hasSupport := id != "outputValues"
 
 	return &pulumirpc.SupportsFeatureResponse{
 		HasSupport: hasSupport,
@@ -151,7 +167,7 @@ func (m *mockMonitor) StreamInvoke(ctx context.Context, in *pulumirpc.ResourceIn
 	panic("not implemented")
 }
 
-func (m *mockMonitor) Call(ctx context.Context, in *pulumirpc.CallRequest,
+func (m *mockMonitor) Call(ctx context.Context, in *pulumirpc.ResourceCallRequest,
 	opts ...grpc.CallOption,
 ) (*pulumirpc.CallResponse, error) {
 	panic("not implemented")
@@ -206,7 +222,7 @@ func (m *mockMonitor) ReadResource(ctx context.Context, in *pulumirpc.ReadResour
 func (m *mockMonitor) RegisterResource(ctx context.Context, in *pulumirpc.RegisterResourceRequest,
 	opts ...grpc.CallOption,
 ) (*pulumirpc.RegisterResourceResponse, error) {
-	if in.GetType() == string(resource.RootStackType) {
+	if in.GetType() == string(resource.RootStackType) && in.GetParent() == "" {
 		return &pulumirpc.RegisterResourceResponse{
 			Urn: m.newURN(in.GetParent(), in.GetType(), in.GetName()),
 		}, nil
@@ -258,8 +274,26 @@ func (m *mockMonitor) RegisterResource(ctx context.Context, in *pulumirpc.Regist
 
 func (m *mockMonitor) RegisterResourceOutputs(ctx context.Context, in *pulumirpc.RegisterResourceOutputsRequest,
 	opts ...grpc.CallOption,
-) (*empty.Empty, error) {
-	return &empty.Empty{}, nil
+) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
+
+func (m *mockMonitor) RegisterStackTransform(ctx context.Context, in *pulumirpc.Callback,
+	opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
+	panic("not implemented")
+}
+
+func (m *mockMonitor) RegisterStackInvokeTransform(ctx context.Context, in *pulumirpc.Callback,
+	opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
+	panic("not implemented")
+}
+
+func (m *mockMonitor) RegisterPackage(ctx context.Context, in *pulumirpc.RegisterPackageRequest,
+	opts ...grpc.CallOption,
+) (*pulumirpc.RegisterPackageResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "RegisterPackage is not implemented")
 }
 
 type mockEngine struct {
@@ -270,11 +304,11 @@ type mockEngine struct {
 // Log logs a global message in the engine, including errors and warnings.
 func (m *mockEngine) Log(ctx context.Context, in *pulumirpc.LogRequest,
 	opts ...grpc.CallOption,
-) (*empty.Empty, error) {
+) (*emptypb.Empty, error) {
 	if m.logger != nil {
 		m.logger.Printf("%s: %s", in.GetSeverity(), in.GetMessage())
 	}
-	return &empty.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 // GetRootResource gets the URN of the root resource, the resource that should be the root of all
@@ -293,4 +327,10 @@ func (m *mockEngine) SetRootResource(ctx context.Context, in *pulumirpc.SetRootR
 ) (*pulumirpc.SetRootResourceResponse, error) {
 	m.rootResource = in.GetUrn()
 	return &pulumirpc.SetRootResourceResponse{}, nil
+}
+
+func (m *mockEngine) StartDebugging(ctx context.Context, in *pulumirpc.StartDebuggingRequest,
+	opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
 }

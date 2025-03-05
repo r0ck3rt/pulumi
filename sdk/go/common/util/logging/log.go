@@ -31,6 +31,7 @@ import (
 	"sync"
 
 	"github.com/golang/glog"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/slice"
 )
 
 type Filter interface {
@@ -60,19 +61,25 @@ type VerboseLogger glog.Verbose
 // Info is equivalent to the global Info function, guarded by the value of v.
 // See the documentation of V for usage.
 func (v VerboseLogger) Info(args ...interface{}) {
-	glog.Verbose(v).Info(FilterString(fmt.Sprint(args...)))
+	if v {
+		glog.Verbose(v).InfoDepth(1, FilterString(fmt.Sprint(args...)))
+	}
 }
 
 // Infoln is equivalent to the global Infoln function, guarded by the value of v.
 // See the documentation of V for usage.
 func (v VerboseLogger) Infoln(args ...interface{}) {
-	glog.Verbose(v).Infoln(FilterString(fmt.Sprint(args...)))
+	if v {
+		glog.Verbose(v).Infoln(FilterString(fmt.Sprint(args...)))
+	}
 }
 
 // Infof is equivalent to the global Infof function, guarded by the value of v.
 // See the documentation of V for usage.
 func (v VerboseLogger) Infof(format string, args ...interface{}) {
-	glog.Verbose(v).Infof("%s", FilterString(fmt.Sprintf(format, args...)))
+	if v {
+		glog.Verbose(v).InfoDepthf(1, "%s", FilterString(fmt.Sprintf(format, args...)))
+	}
 }
 
 // V builds a logger that logs messages only if verbosity is at least at the provided level.
@@ -81,15 +88,15 @@ func V(level glog.Level) VerboseLogger {
 }
 
 func Errorf(format string, args ...interface{}) {
-	glog.Errorf("%s", FilterString(fmt.Sprintf(format, args...)))
+	glog.ErrorDepthf(1, "%s", FilterString(fmt.Sprintf(format, args...)))
 }
 
 func Infof(format string, args ...interface{}) {
-	glog.Infof("%s", FilterString(fmt.Sprintf(format, args...)))
+	glog.InfoDepthf(1, "%s", FilterString(fmt.Sprintf(format, args...)))
 }
 
 func Warningf(format string, args ...interface{}) {
-	glog.Warningf("%s", FilterString(fmt.Sprintf(format, args...)))
+	glog.WarningDepthf(1, "%s", FilterString(fmt.Sprintf(format, args...)))
 }
 
 func Flush() {
@@ -156,7 +163,7 @@ func AddGlobalFilter(filter Filter) {
 }
 
 func CreateFilter(secrets []string, replacement string) Filter {
-	items := make([]string, 0, len(secrets))
+	items := slice.Prealloc[string](len(secrets))
 	for _, secret := range secrets {
 		// For short secrets, don't actually add them to the filter, this is a trade-off we make to prevent
 		// displaying `[secret]`. Travis does a similar thing, for example.
