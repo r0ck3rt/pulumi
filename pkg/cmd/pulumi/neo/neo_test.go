@@ -247,6 +247,17 @@ func TestNewNeoCmd_HiddenWhenNotExperimental(t *testing.T) {
 	assert.True(t, cmd.Hidden, "without PULUMI_EXPERIMENTAL the command must be hidden")
 }
 
+func TestDedupeExistingRoots(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	missing := tmp + "/does-not-exist"
+
+	got := dedupeExistingRoots("", tmp, tmp, missing, t.TempDir())
+	require.Len(t, got, 2, "empties, missing paths, and duplicates must be dropped")
+	assert.Equal(t, tmp, got[0], "first occurrence of a canonical path is preserved verbatim")
+}
+
 // -----------------------------------------------------------------------------
 // newPulumiSinkForUI
 //

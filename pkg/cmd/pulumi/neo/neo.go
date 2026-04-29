@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -122,11 +123,15 @@ func runNeo(ctx context.Context, prompt, stackName, orgFlag, cwdFlag string) err
 		return err
 	}
 
-	fs, err := tools.NewFilesystem(cwdFlag)
+	// Allow tools to read/write under temp directories in addition to cwd: the agent
+	// stages scratch files there (downloads, intermediate state) and the CLI sandbox
+	// would otherwise reject those paths. See pulumi/pulumi-service#42027.
+	extraRoots := dedupeExistingRoots("/tmp", os.TempDir())
+	fs, err := tools.NewFilesystem(cwdFlag, extraRoots...)
 	if err != nil {
 		return err
 	}
-	sh, err := tools.NewShell(cwdFlag)
+	sh, err := tools.NewShell(cwdFlag, extraRoots...)
 	if err != nil {
 		return err
 	}
@@ -330,6 +335,30 @@ func resolveTaskTarget(
 		return "", "", "", errors.New("could not determine an organization for the Neo task; pass --org")
 	}
 	return org, projectName, stack, nil
+}
+
+// dedupeExistingRoots returns candidates with duplicates removed by canonical path,
+// dropping any that don't resolve on the local filesystem. This handles macOS where
+// /tmp and os.TempDir() are distinct canonical roots, Linux where they collapse to
+// the same one, and Windows where /tmp typically doesn't exist.
+func dedupeExistingRoots(candidates ...string) []string {
+	seen := make(map[string]bool, len(candidates))
+	var out []string
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		canon, err := filepath.EvalSymlinks(c)
+		if err != nil {
+			continue
+		}
+		if seen[canon] {
+			continue
+		}
+		seen[canon] = true
+		out = append(out, c)
+	}
+	return out
 }
 
 // newPulumiSinkForUI builds a tools.PulumiSink whose callbacks translate each

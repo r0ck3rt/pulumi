@@ -208,7 +208,7 @@ func (p *Pulumi) run(ctx context.Context, a pulumiArgs, isPreview bool) (pulumiR
 	}
 
 	// Confine local_pulumi_dir to the Session sandbox.
-	dir, err := resolveUnderRoot(p.Cwd, a.LocalPulumiDir, false)
+	dir, err := resolveUnderRoots([]string{p.Cwd}, a.LocalPulumiDir, false)
 	if err != nil {
 		return pulumiResult{}, err
 	}
