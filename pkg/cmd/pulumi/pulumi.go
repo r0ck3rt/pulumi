@@ -76,6 +76,7 @@ import (
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/trace"
 	cmdVersion "github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/version"
 	"github.com/pulumi/pulumi/pkg/v3/cmd/pulumi/whoami"
+	backendlogging "github.com/pulumi/pulumi/pkg/v3/logging"
 	"github.com/pulumi/pulumi/pkg/v3/util/tracing"
 	pkgWorkspace "github.com/pulumi/pulumi/pkg/v3/workspace"
 	"github.com/pulumi/pulumi/sdk/v3/go/common/diag"
@@ -194,12 +195,17 @@ func NewPulumiCmd() (*cobra.Command, func()) {
 	var color string
 	var memProfileRate int
 	var rootSpan oteltrace.Span
+	var autoLogger *backendlogging.Logger
 
 	processStartTime := time.Now()
 
 	updateCheckResult := make(chan *updateCheckResult)
 
 	cleanup := func() {
+		// Logger.Close is a no-op when autoLogger is nil.
+		if err := autoLogger.Close(); err != nil {
+			logging.V(3).Infof("automatic log close error: %v", err)
+		}
 		logging.Flush()
 		cmdutil.CloseTracing()
 
@@ -278,6 +284,20 @@ func NewPulumiCmd() (*cobra.Command, func()) {
 			}
 
 			logging.InitLogging(logToStderr, verbose, logFlow)
+
+			// Start automatic logging. At this point we don't have a stack
+			// or secrets manager, so logs will be gzip-compressed (not
+			// encrypted). Engine operations may upgrade to encrypted logging
+			// when a secrets manager becomes available.
+			if env.EnableAutomaticLogging.Value() {
+				var logErr error
+				autoLogger, logErr = backendlogging.StartLogging(
+					cmd.Context(), nil /* sm */)
+				if logErr != nil {
+					logging.V(3).Infof("automatic logging unavailable: %v", logErr)
+				}
+			}
+
 			cmdutil.InitTracing("pulumi-cli", "pulumi", tracingFlag)
 
 			if err := cmdutil.InitOtelReceiver(otelTracesFlag); err != nil {
