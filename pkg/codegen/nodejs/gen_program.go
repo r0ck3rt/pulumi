@@ -1079,6 +1079,11 @@ func moduleName(module string, pkg schema.PackageReference) string {
 				module = m
 			}
 		}
+		// pulumi:pulumi:* resources (e.g. StackReference) belong to the root of the
+		// package, not a "pulumi" submodule.
+		if pkg.Name() == "pulumi" && module == "pulumi" {
+			return ""
+		}
 	}
 	if module == "index" {
 		return ""
